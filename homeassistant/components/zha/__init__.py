@@ -5,8 +5,6 @@ For more details about this component, please refer to the documentation at
 https://home-assistant.io/components/zha/
 """
 import logging
-import os
-import types
 
 import voluptuous as vol
 
@@ -17,21 +15,23 @@ from homeassistant.helpers.device_registry import CONNECTION_ZIGBEE
 # Loading the config flow file will register the flow
 from . import config_flow  # noqa  # pylint: disable=unused-import
 from . import api
-from .core.gateway import ZHAGateway
-from .const import (
+from .core import ZHAGateway
+from .core.const import (
     COMPONENTS, CONF_BAUDRATE, CONF_DATABASE, CONF_DEVICE_CONFIG,
-    CONF_RADIO_TYPE, CONF_USB_PATH, DATA_ZHA, DATA_ZHA_BRIDGE_ID,
+    CONF_RADIO_TYPE, CONF_USB_PATH, DATA_ZHA,
     DATA_ZHA_CONFIG, DATA_ZHA_CORE_COMPONENT, DATA_ZHA_DISPATCHERS,
-    DATA_ZHA_RADIO, DEFAULT_BAUDRATE, DEFAULT_DATABASE_NAME,
-    DEFAULT_RADIO_TYPE, DOMAIN, RadioType, DATA_ZHA_CORE_EVENTS,
-    ENABLE_QUIRKS)
+    DATA_ZHA_RADIO, DEFAULT_BAUDRATE, DATA_ZHA_GATEWAY,
+    DEFAULT_RADIO_TYPE, DOMAIN, RadioType, DATA_ZHA_CORE_EVENTS, ENABLE_QUIRKS)
+from .core.registries import establish_device_mappings
+from .core.channels.registry import populate_channel_registry
+from .core.patches import apply_cluster_listener_patch
 
 REQUIREMENTS = [
-    'bellows==0.7.0',
-    'zigpy==0.2.0',
-    'zigpy-xbee==0.1.1',
-    'zha-quirks==0.0.6',
-    'zigpy-deconz==0.0.1'
+    'bellows-homeassistant==0.7.1',
+    'zigpy-homeassistant==0.3.0',
+    'zigpy-xbee-homeassistant==0.1.2',
+    'zha-quirks==0.0.7',
+    'zigpy-deconz==0.1.2'
 ]
 
 DEVICE_CONFIG_SCHEMA_ENTRY = vol.Schema({
@@ -87,9 +87,16 @@ async def async_setup_entry(hass, config_entry):
 
     Will automatically load components to support devices found on the network.
     """
+    establish_device_mappings()
+    populate_channel_registry()
+
+    for component in COMPONENTS:
+        hass.data[DATA_ZHA][component] = (
+            hass.data[DATA_ZHA].get(component, {})
+        )
+
     hass.data[DATA_ZHA] = hass.data.get(DATA_ZHA, {})
     hass.data[DATA_ZHA][DATA_ZHA_DISPATCHERS] = []
-
     config = hass.data[DATA_ZHA].get(DATA_ZHA_CONFIG, {})
 
     if config.get(ENABLE_QUIRKS, True):
@@ -98,66 +105,33 @@ async def async_setup_entry(hass, config_entry):
         # pylint: disable=W0611, W0612
         import zhaquirks  # noqa
 
-    usb_path = config_entry.data.get(CONF_USB_PATH)
-    baudrate = config.get(CONF_BAUDRATE, DEFAULT_BAUDRATE)
-    radio_type = config_entry.data.get(CONF_RADIO_TYPE)
-    if radio_type == RadioType.ezsp.name:
-        import bellows.ezsp
-        from bellows.zigbee.application import ControllerApplication
-        radio = bellows.ezsp.EZSP()
-        radio_description = "EZSP"
-    elif radio_type == RadioType.xbee.name:
-        import zigpy_xbee.api
-        from zigpy_xbee.zigbee.application import ControllerApplication
-        radio = zigpy_xbee.api.XBee()
-        radio_description = "XBee"
-    elif radio_type == RadioType.deconz.name:
-        import zigpy_deconz.api
-        from zigpy_deconz.zigbee.application import ControllerApplication
-        radio = zigpy_deconz.api.Deconz()
-        radio_description = "Deconz"
-
-    await radio.connect(usb_path, baudrate)
-    hass.data[DATA_ZHA][DATA_ZHA_RADIO] = radio
-
-    if CONF_DATABASE in config:
-        database = config[CONF_DATABASE]
-    else:
-        database = os.path.join(hass.config.config_dir, DEFAULT_DATABASE_NAME)
-
     # patch zigpy listener to prevent flooding logs with warnings due to
     # how zigpy implemented its listeners
-    from zigpy.appdb import ClusterPersistingListener
+    apply_cluster_listener_patch()
 
-    def zha_send_event(self, cluster, command, args):
-        pass
-
-    ClusterPersistingListener.zha_send_event = types.MethodType(
-        zha_send_event,
-        ClusterPersistingListener
-    )
-
-    application_controller = ControllerApplication(radio, database)
     zha_gateway = ZHAGateway(hass, config)
-    application_controller.add_listener(zha_gateway)
-    await application_controller.startup(auto_form=True)
-
-    for device in application_controller.devices.values():
-        hass.async_create_task(
-            zha_gateway.async_device_initialized(device, False))
+    await zha_gateway.async_initialize(config_entry)
 
     device_registry = await \
         hass.helpers.device_registry.async_get_registry()
     device_registry.async_get_or_create(
         config_entry_id=config_entry.entry_id,
-        connections={(CONNECTION_ZIGBEE, str(application_controller.ieee))},
-        identifiers={(DOMAIN, str(application_controller.ieee))},
+        connections={
+            (
+                CONNECTION_ZIGBEE,
+                str(zha_gateway.application_controller.ieee)
+            )
+        },
+        identifiers={
+            (
+                DOMAIN,
+                str(zha_gateway.application_controller.ieee)
+            )
+        },
         name="Zigbee Coordinator",
         manufacturer="ZHA",
-        model=radio_description,
+        model=zha_gateway.radio_description,
     )
-
-    hass.data[DATA_ZHA][DATA_ZHA_BRIDGE_ID] = str(application_controller.ieee)
 
     for component in COMPONENTS:
         hass.async_create_task(
@@ -165,13 +139,16 @@ async def async_setup_entry(hass, config_entry):
                 config_entry, component)
         )
 
-    api.async_load_api(hass, application_controller, zha_gateway)
+    api.async_load_api(hass)
 
-    def zha_shutdown(event):
-        """Close radio."""
+    async def async_zha_shutdown(event):
+        """Handle shutdown tasks."""
+        await hass.data[DATA_ZHA][
+            DATA_ZHA_GATEWAY].async_update_device_storage()
         hass.data[DATA_ZHA][DATA_ZHA_RADIO].close()
 
-    hass.bus.async_listen_once(ha_const.EVENT_HOMEASSISTANT_STOP, zha_shutdown)
+    hass.bus.async_listen_once(
+        ha_const.EVENT_HOMEASSISTANT_STOP, async_zha_shutdown)
     return True
 
 
